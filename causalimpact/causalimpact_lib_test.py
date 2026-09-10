@@ -271,6 +271,45 @@ class CausalImpactTest(parameterized.TestCase):
         prior_level_sd,
         atol=0.2 * prior_level_sd)
 
+  @parameterized.named_parameters(
+      {
+          "testcase_name": "0.01",
+          "prior_slope_sd": 0.01,
+      }, {
+          "testcase_name": "0.1",
+          "prior_slope_sd": 0.1,
+      })
+  def testPriorSlopeSdIsUsed(self, prior_slope_sd):
+    seed = (0, 0)
+    treatment_start = 20
+    data = self.data
+    ci_analysis = ci.fit_causalimpact(
+        data=data,
+        pre_period=(data.index[0], data.index[treatment_start - 1]),
+        post_period=(data.index[treatment_start], data.index[-1]),
+        inference_options=ci.InferenceOptions(
+            num_results=100, num_warmup_steps=100),
+        model_options=ci.ModelOptions(prior_slope_sd=prior_slope_sd),
+        seed=seed)
+    self.assertIsNotNone(ci_analysis.posterior_samples.slope)
+    np.testing.assert_allclose(
+        np.mean(ci_analysis.posterior_samples.slope_scale),
+        prior_slope_sd,
+        atol=0.2 * prior_slope_sd)
+
+  def testPriorSlopeSdDefaultsToNone(self):
+    seed = (0, 0)
+    treatment_start = 20
+    data = self.data
+    ci_analysis = ci.fit_causalimpact(
+        data=data,
+        pre_period=(data.index[0], data.index[treatment_start - 1]),
+        post_period=(data.index[treatment_start], data.index[-1]),
+        inference_options=ci.InferenceOptions(num_results=10),
+        seed=seed)
+    self.assertIsNone(ci_analysis.posterior_samples.slope)
+    self.assertIsNone(ci_analysis.posterior_samples.slope_scale)
+
   def testModelTrainingNoDatetimeIndexSucceeds(self):
     seed = (0, 0)
     data = self.data.copy()
@@ -316,6 +355,29 @@ class CausalImpactTest(parameterized.TestCase):
         any(["LocalLevel/_level_scale" in param for param in model_params]) or
         # Name used by GibbsSampler.
         any(["local_level/_level_scale" in param for param in model_params]))
+
+  def testModelTrainingWithLocalLinearTrend(self):
+    ci_data = cid.CausalImpactData(
+        self.data["y"],
+        pre_period=self.pre_period,
+        post_period=self.post_period,
+        dtype=tf.float64)
+    sts_model = causalimpact_lib._build_default_gibbs_model(
+        ci_data.feature_ts,
+        ci_data.outcome_ts,
+        outcome_sd=tf.constant(1., dtype=tf.float64),
+        level_scale=tf.constant(0.01, dtype=tf.float64),
+        slope_scale=tf.constant(0.01, dtype=tf.float64),
+        dtype=tf.float64,
+        seasons=[])
+    model_params = [p.name for p in sts_model.parameters]
+    self.assertIn("observation_noise_scale", model_params)
+    self.assertTrue(
+        any(["local_linear_trend/_level_scale" in param
+             for param in model_params]))
+    self.assertTrue(
+        any(["local_linear_trend/_slope_scale" in param
+             for param in model_params]))
 
   def testModelTrainingWithCovariates(self):
     seed = (1, 1)
