@@ -50,6 +50,10 @@ class CausalImpactPosteriorSamples:
   level_scale: Optional[tf.Tensor]
   # Shape is [num_samples].
   level: Optional[tf.Tensor]
+  # Shape is [num_samples]. None unless ModelOptions.prior_slope_sd is set.
+  slope_scale: Optional[tf.Tensor]
+  # Shape is [num_samples]. None unless ModelOptions.prior_slope_sd is set.
+  slope: Optional[tf.Tensor]
   # Shape is [num_samples, num_covariates + 1 (for intercept)].
   weights: Optional[tf.Tensor]
   # Shape is [num_samples, num_seasonal_effects]
@@ -190,7 +194,19 @@ class ModelOptions:
       Defaults to 0.01, a typical choice for well-behaved and stable datasets
       with low residual volatility. When in doubt, a safer option is to use 0.1,
       as validated on synthetic data, although this may sometimes give rise to
-      unrealistically wide prediction intervals.
+      unrealistically wide prediction intervals. Only applies to the default
+      model; has no effect if a custom `model` is passed to
+      `fit_causalimpact`.
+    prior_slope_sd: Optional[float]: Prior standard deviation of the Gaussian
+      random walk of the slope of a local linear trend model. Expressed in
+      terms of data standard deviations. Defaults to None, in which case the
+      trend component is a local level model (no slope). Setting this to a
+      float (e.g. 0.01, matching the default used for prior_level_sd) instead
+      models the trend as a local linear trend, whose slope is itself allowed
+      to drift over time -- useful when the series is expected to have a
+      trend that changes over time rather than a level that fluctuates
+      around a fixed mean. Only applies to the default model; has no effect
+      if a custom `model` is passed to `fit_causalimpact`.
     seasons: This supports a list of Seasons, for modeling
       multiple seasons. For instance, for hourly data, there could be
       both an hour-of-the-day (num_seasons=24, num_steps_per_season=1), and
@@ -200,6 +216,7 @@ class ModelOptions:
       num_steps_per_season=1).
   """
   prior_level_sd: float = 0.01
+  prior_slope_sd: Optional[float] = None
   seasons: List[Seasons] = dataclasses.field(default_factory=list)
 
 
@@ -282,6 +299,7 @@ def fit_causalimpact(data: pd.DataFrame,
     posterior_samples, posterior_means, posterior_trajectories = _train_causalimpact_sts(
         ci_data=ci_data,
         prior_level_sd=model_options.prior_level_sd,
+        prior_slope_sd=model_options.prior_slope_sd,
         seed=seed,
         num_results=inference_options.num_results,
         num_warmup_steps=inference_options.num_warmup_steps,  # pyrefly: ignore[bad-argument-type]
@@ -327,6 +345,10 @@ def fit_causalimpact(data: pd.DataFrame,
         observation_noise_scale=posterior_samples.observation_noise_scale,
         level_scale=posterior_samples.level_scale,
         level=posterior_samples.level,
+        slope_scale=(posterior_samples.slope_scale
+                     if model_options.prior_slope_sd is not None else None),
+        slope=(posterior_samples.slope
+               if model_options.prior_slope_sd is not None else None),
         weights=(posterior_samples.weights
                  if posterior_samples.weights.shape[1] > 0 else None),
         seasonal_drift_scales=(
@@ -348,6 +370,7 @@ def _run_gibbs_sampler(
     outcome_sd: TensorLike, design_matrix: Optional[TensorLike],
     num_results: int, num_warmup_steps: int,
     observation_noise_scale: TensorLike, level_scale: TensorLike,
+    slope_scale: Optional[TensorLike],
     seasonal_drift_scales: TensorLike, weights: TensorLike, level: TensorLike,
     slope: TensorLike, seed: TensorLike, dtype, seasons: List[Seasons],
     experimental_tf_function_cache_key_addition: int):  # pylint: disable=unused-argument
@@ -357,6 +380,7 @@ def _run_gibbs_sampler(
         design_matrix=design_matrix,
         outcome_ts=outcome_ts,
         level_scale=level_scale,
+        slope_scale=slope_scale,
         outcome_sd=outcome_sd,
         dtype=dtype,
         seasons=seasons)
@@ -370,8 +394,8 @@ def _run_gibbs_sampler(
       initial_state=gibbs_sampler.GibbsSamplerState(
           observation_noise_scale=observation_noise_scale,
           level_scale=level_scale,
-          # Model has no slope component.
-          slope_scale=tf.zeros([], dtype=dtype),
+          slope_scale=(slope_scale if slope_scale is not None
+                       else tf.zeros([], dtype=dtype)),
           weights=weights,
           level=level,
           slope=slope,
@@ -395,6 +419,28 @@ def _run_gibbs_sampler(
   return posterior_samples, posterior_means, posterior_trajectories
 
 
+def _build_variance_prior(scale, sample_size, upper_bound, dtype):
+  """Builds an InverseGamma prior on variance from a `*_sd`-style scale.
+
+  Args:
+    scale: tf.Tensor - Prior scale (e.g. a level_scale or slope_scale).
+    sample_size: tf.Tensor - Pseudo-observation count controlling how tightly
+      the prior concentrates around `scale`.
+    upper_bound: tf.Tensor - Upper bound to clamp the resulting prior to.
+    dtype: Desired dtype for the prior.
+
+  Returns:
+    A tfd.InverseGamma instance with `upper_bound` set.
+  """
+  concentration = tf.cast(sample_size / 2., dtype=dtype)
+  variance_prior_scale = scale * scale * (  # pyrefly: ignore[unsupported-operation]
+      sample_size / 2.)
+  variance_prior = tfd.InverseGamma(
+      concentration=concentration, scale=variance_prior_scale)
+  variance_prior.upper_bound = upper_bound
+  return variance_prior
+
+
 def _build_default_gibbs_model(
     design_matrix: Optional[tf.Tensor],
     outcome_ts: tfp.sts.MaskedTimeSeries,
@@ -402,11 +448,14 @@ def _build_default_gibbs_model(
     outcome_sd: tf.Tensor,
     dtype,
     seasons: List[Seasons],
+    slope_scale: Optional[tf.Tensor] = None,
 ):
   """A method to build the default STS model.
 
   The default model is a local level model with observation noise, plus optional
-  sparse regression using observed covariates, if given.
+  sparse regression using observed covariates, if given. If `slope_scale` is
+  provided, the trend component is a local linear trend model instead, with
+  the slope's random walk scaled analogously to the level's.
 
   Args:
     design_matrix: Optional Tensor of [timesteps, features] with the covariates.
@@ -417,19 +466,21 @@ def _build_default_gibbs_model(
     dtype: Desired dtype for Gibbs model.
     seasons: An interable of seasonal options for seasonal components to add
       to the model.
+    slope_scale: Optional tf.Tensor - Initial scale for the slope of a local
+      linear trend model. If None (default), the trend component is a local
+      level model with no slope.
 
   Returns:
     A tfp.sts.StructuralTimeSeries instance.
   """
   local_level_prior_sample_size = tf.constant(32., dtype=dtype)
 
-  level_concentration = tf.cast(local_level_prior_sample_size / 2., dtype=dtype)
-  level_variance_prior_scale = level_scale * level_scale * (  # pyrefly: ignore[unsupported-operation]
-      local_level_prior_sample_size / 2.)
+  level_variance_prior = _build_variance_prior(
+      level_scale, local_level_prior_sample_size, outcome_sd, dtype)
 
-  level_variance_prior = tfd.InverseGamma(
-      concentration=level_concentration, scale=level_variance_prior_scale)
-  level_variance_prior.upper_bound = outcome_sd
+  slope_variance_prior = (
+      None if slope_scale is None else _build_variance_prior(
+          slope_scale, local_level_prior_sample_size, outcome_sd, dtype))
 
   if design_matrix is not None:
     observation_noise_variance_prior = tfd.InverseGamma(
@@ -493,7 +544,7 @@ def _build_default_gibbs_model(
       design_matrix=design_matrix,
       weights_prior=weights_prior,
       level_variance_prior=level_variance_prior,
-      slope_variance_prior=None,
+      slope_variance_prior=slope_variance_prior,
       observation_noise_variance_prior=observation_noise_variance_prior,
       initial_level_prior=initial_level_prior,
       sparse_weights_nonzero_prob=sparse_weights_nonzero_prob,
@@ -504,6 +555,7 @@ def _train_causalimpact_sts(
     *,
     ci_data: cid.CausalImpactData,
     prior_level_sd,
+    prior_slope_sd: Optional[float] = None,
     seed: _SeedType,
     num_results: int,
     num_warmup_steps: int,
@@ -520,6 +572,13 @@ def _train_causalimpact_sts(
     ci_data: CausalImpact data, used to fit a model.
     prior_level_sd: float: Prior standard deviation of the Gaussian random walk
       of the local level model. Expressed in terms of data standard deviations.
+      Only applies to the default model; has no effect if a custom `model` is
+      passed.
+    prior_slope_sd: Optional[float]: Prior standard deviation of the Gaussian
+      random walk of the slope of a local linear trend model. If None
+      (default), the trend component is a local level model with no slope.
+      Only applies to the default model; has no effect if a custom `model` is
+      passed.
     seed: PRNG seed; see `tensorflow_probability.random.sanitize_seed` for
       details.
     num_results: See `fit_causalimpact`.
@@ -570,6 +629,9 @@ def _train_causalimpact_sts(
   else:
     observation_noise_scale = outcome_sd
   level_scale = tf.ones([], dtype=dtype) * prior_level_sd * outcome_sd
+  slope_scale = (
+      None if prior_slope_sd is None else
+      tf.ones([], dtype=dtype) * prior_slope_sd * outcome_sd)
   seasonal_drift_scales = 0.01 * outcome_sd * tf.ones(
       shape=[len(seasons)], dtype=dtype)
   if ci_data.feature_ts is None:
@@ -589,6 +651,7 @@ def _train_causalimpact_sts(
       num_warmup_steps=num_warmup_steps,
       observation_noise_scale=observation_noise_scale,
       level_scale=level_scale,
+      slope_scale=slope_scale,
       seasonal_drift_scales=seasonal_drift_scales,
       weights=weights,
       level=level,
